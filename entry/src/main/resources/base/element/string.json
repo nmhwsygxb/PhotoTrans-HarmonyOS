@@ -1,0 +1,16 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "PhotoTrans entry module"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "PhotoTrans - 跨品牌文件/照片传输"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "PhotoTrans"
+    }
+  ]
+}

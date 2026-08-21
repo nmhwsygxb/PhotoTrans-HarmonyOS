@@ -1,0 +1,10 @@
+{
+  "src": [
+    "pages/Index",
+    "pages/DeviceList",
+    "pages/FarConnect",
+    "pages/ModelManagement",
+    "pages/Settings",
+    "pages/TransferProgress"
+  ]
+}
