@@ -1,0 +1,17 @@
+# DevEco / hvigor
+oh_modules/
+.ohpm/
+.hvigor/
+.local.properties
+build/
+entry/build/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+.DS_Store
+
+# Logs
+*.log
+oh-package-lock.json5
