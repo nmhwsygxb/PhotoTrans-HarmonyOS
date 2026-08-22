@@ -173,6 +173,10 @@ export class NetworkService {
   private clientSocket: socket.TCPSocket | null = null;
   private clientConnection: socket.TCPSocketConnection | null = null;
   private clientTextBuf: string = '';
+  /** 重连参数：目标 IP、端口、对端名称 */
+  private clientTargetIp: string = '';
+  private clientTargetPort: number = 0;
+  private clientTargetPeerName: string = '';
   private clientInBody: boolean = false;
 
   // 发送队列
@@ -232,6 +236,17 @@ export class NetworkService {
       });
     } catch (e) {
       this.logErr('writeLine', `${JSON.stringify(e)}`);
+    }
+  }
+
+  /** 发送标准 HTTP 响应（使用 \r\n\r\n 结尾，与各端兼容） */
+  private sendHttpResponse(connLike: socket.TCPSocketConnection, status: string): void {
+    try {
+      connLike.send({
+        data: encodeUtf8(`HTTP/1.1 ${status}\r\n\r\n`)
+      });
+    } catch (e) {
+      this.logErr('sendHttpResponse', `${JSON.stringify(e)}`);
     }
   }
 
@@ -369,7 +384,7 @@ export class NetworkService {
     const lines = line.split('\r\n');
     const requestLine = lines[0];
     if (!requestLine.startsWith('PUT /')) {
-      this.writeLine(peer.conn, 'HTTP/1.1 400 Bad Request\r\n');
+      this.sendHttpResponse(peer.conn, '400 Bad Request');
       return;
     }
     // 提取文件名
@@ -377,6 +392,8 @@ export class NetworkService {
     const rawPath = pathMatch ? pathMatch[1] : 'file.bin';
     let fileName = 'file.bin';
     try { fileName = decodeURIComponent(rawPath); } catch (e) { fileName = rawPath; }
+    // 安全检查: 防止路径穿越
+    fileName = fileName.replace(/[\\/:*?"<>|]/g, '_');
 
     // 解析 Content-Length
     let size = 0;
@@ -389,14 +406,14 @@ export class NetworkService {
     }
 
     if (size <= 0) {
-      this.writeLine(peer.conn, 'HTTP/1.1 411 Length Required\r\n');
+      this.sendHttpResponse(peer.conn, '411 Length Required');
       return;
     }
 
     // 构造接收路径
     const dest = this.buildReceivePath(fileName);
     if (dest.length === 0) {
-      this.writeLine(peer.conn, 'HTTP/1.1 507 Insufficient Storage\r\n');
+      this.sendHttpResponse(peer.conn, '507 Insufficient Storage');
       return;
     }
 
@@ -413,13 +430,12 @@ export class NetworkService {
       peer.outStream = fileIo.openSync(dest, fileIo.OpenMode.READ_WRITE | fileIo.OpenMode.CREATE | fileIo.OpenMode.TRUNC);
     } catch (e) {
       this.logErr('beginPut', `open fail ${dest} ${JSON.stringify(e)}`);
-      this.writeLine(peer.conn, 'HTTP/1.1 500 Internal Error\r\n');
+      this.sendHttpResponse(peer.conn, '500 Internal Error');
       peer.inBody = false;
       peer.outStream = null;
       return;
     }
-    // 202 接受
-    this.writeLine(peer.conn, 'HTTP/1.1 202 Accepted\r\n');
+    // 等待 body 接收完成后发 200 OK（在 finalizeRx 中发送），不提前发 202
   }
 
   /** 构造安全接收路径（放在 receiveDir/<kind>/）。返回空串表示失败 */
@@ -497,7 +513,7 @@ export class NetworkService {
     }
     if (meta) {
       // 标准 HTTP 200 OK 响应（与 Android 兼容）
-      this.writeLine(peer.conn, 'HTTP/1.1 200 OK\r\n');
+      this.sendHttpResponse(peer.conn, '200 OK');
       this.logBuf('finalizeRx', `received ${meta.fileName}`);
       if (this.fileDoneHandler) {
         this.fileDoneHandler(meta.fileId, true);
@@ -522,6 +538,10 @@ export class NetworkService {
     if (this.isSending) {
       throw new Error('already busy sending');
     }
+    // 保存连接参数以便后续重连
+    this.clientTargetIp = ip;
+    this.clientTargetPort = port;
+    this.clientTargetPeerName = peerName;
     // 建立连接 + 握手
     await this.openClient(ip, port, peerName);
     this.fileQueue = files.slice();
@@ -546,25 +566,55 @@ export class NetworkService {
       this.cleanupTx();
       return;
     }
-    const f = this.fileQueue[tx.index];
-    const fileProg: FileProgress = this.makeFileProgress(f, 0);
-    tx.task.currentFile = fileProg;
-    tx.task.transferredBytes = this.fileQueue.slice(0, tx.index).reduce((a, x) => a + x.size, 0);
-    this.emit(tx.task);
-    this.sendOneFile(tx, f).then(() => {
-      tx.index++;
-      tx.task.completedFiles++;
-      tx.task.currentFile = null;
-      tx.task.overallPercent = tx.task.totalBytes > 0 ?
-        Math.round(tx.task.transferredBytes / tx.task.totalBytes * 100) : 100;
+
+    // 若连接断开（Android 接收端每文件关闭 socket），则重新连接
+    this.ensureConnected().then(() => {
+      const f = this.fileQueue[tx.index];
+      const fileProg: FileProgress = this.makeFileProgress(f, 0);
+      tx.task.currentFile = fileProg;
+      tx.task.transferredBytes = this.fileQueue.slice(0, tx.index).reduce((a, x) => a + x.size, 0);
       this.emit(tx.task);
-      this.drainQueue();
+      this.sendOneFile(tx, f).then(() => {
+        tx.index++;
+        tx.task.completedFiles++;
+        tx.task.currentFile = null;
+        tx.task.overallPercent = tx.task.totalBytes > 0 ?
+          Math.round(tx.task.transferredBytes / tx.task.totalBytes * 100) : 100;
+        this.emit(tx.task);
+        // 如果还有更多文件，关闭旧连接（Android 端每文件关闭 socket，所以我们也主动断开）
+        if (tx.index < this.fileQueue.length) {
+          this.closeClient();
+        }
+        this.drainQueue();
+      }).catch((err) => {
+        tx.task.state = TransferState.FAILED;
+        tx.task.errorMessage = `${err}`;
+        this.emit(tx.task);
+        this.cleanupTx();
+      });
     }).catch((err) => {
       tx.task.state = TransferState.FAILED;
       tx.task.errorMessage = `${err}`;
       this.emit(tx.task);
       this.cleanupTx();
     });
+  }
+
+  /** 确保客户端连接可用，若断开则重连 */
+  private async ensureConnected(): Promise<void> {
+    if (this.clientConnection) { return; }
+    if (!this.clientTargetIp) { throw new Error('no target to reconnect'); }
+    await this.openClient(this.clientTargetIp, this.clientTargetPort, this.clientTargetPeerName);
+  }
+
+  /** 关闭客户端连接（不清理队列） */
+  private closeClient(): void {
+    this.clientConnection = null;
+    this.clientTextBuf = '';
+    if (this.clientSocket) {
+      try { this.clientSocket.close(); } catch (e) { /* ignore */ }
+      this.clientSocket = null;
+    }
   }
 
   private cleanupTx(): void {
@@ -604,10 +654,6 @@ export class NetworkService {
       let completed = false;
 
       const lastProgress = { ts: 0 };
-
-      // 校验 202 响应是否有必要：为简化，Android 版也等待；这里写文件体前发 202 由接收方回复，
-      // 但流式发送不必等待，直接发送 body。收方对多余 ACK 吸收。
-      // 这里仍然读取对方可能发回的 202 帧（本实现已在客户端 attachClient 处理）。
 
       const pump = () => {
         if (completed) { return; }
@@ -703,6 +749,7 @@ export class NetworkService {
               const peerName = ProtocolPacket.parse(line);
               if (peerName) {
                 ackRecv = true;
+                this.clientTextBuf = ''; // 握手完成后清理缓冲
                 clearTimeout(timer);
                 if (!resolved) {
                   resolved = true;
