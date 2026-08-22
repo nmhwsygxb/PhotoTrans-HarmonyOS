@@ -30,19 +30,24 @@ const BEACON_PREFIX = 'PT-BEACON';
 /** beacon 字符串 -> DiscoveredDevice */
 function parseBeacon(line: string, fromIp: string): DiscoveredDevice | null {
   const parts = line.split('|');
-  if (parts.length < 6 || parts[0] !== BEACON_PREFIX) {
+  // 统一格式: PT-BEACON|<deviceName>|<brand>|<ip>|<port>|
+  if (parts.length < 5 || parts[0] !== BEACON_PREFIX) {
     return null;
   }
-  // PT-BEACON|<deviceId>|<name>|<port>|<proto>|<brand>
+  const deviceName = parts[1];
+  const brandStr = parts[2];
+  const ip = parts[3].length > 0 ? parts[3] : fromIp;
+  const port = Number.parseInt(parts[4]) || Constants.DEFAULT_TRANSFER_PORT;
   let brand: Brand = Brand.UNKNOWN;
-  try { brand = parts[5] as Brand; } catch (e) { /* keep */ }
+  try { brand = brandStr as Brand; } catch (e) { /* keep */ }
+  const identity = `${deviceName}|${ip}`;
   return {
-    deviceId: parts[1],
-    deviceName: parts[2],
+    deviceId: identity,
+    deviceName: deviceName,
     brand: brand,
-    ip: fromIp,
-    port: Number.parseInt(parts[3]) || Constants.DEFAULT_TRANSFER_PORT,
-    protocolVersion: parts[4],
+    ip: ip,
+    port: port,
+    protocolVersion: '1.0',
     lastSeen: Date.now(),
     isSelf: false,
     signal: 0
@@ -63,9 +68,9 @@ function decodeUtf8(buf: ArrayBuffer): string {
 export class DiscoveryService {
   private static instance: DiscoveryService | null = null;
 
-  private myDeviceId: string = '';
   private myName: string = '';
   private myBrand: Brand = Brand.HUAWEI;
+  private myDeviceIdentity: string = ''; // "name|ip"
 
   private udpSocket: socket.UDPSocket | null = null;
   private running: boolean = false;
@@ -88,9 +93,9 @@ export class DiscoveryService {
   }
 
   setupIdentity(deviceId: string, name: string, brand: Brand): void {
-    this.myDeviceId = deviceId;
     this.myName = name;
     this.myBrand = brand;
+    this.myDeviceIdentity = `${name}|${this.selfIp}`;
   }
 
   setListener(l: DiscoveryListener | null): void { this.listener = l; }
@@ -112,8 +117,8 @@ export class DiscoveryService {
     this.running = true;
 
     // 初始化基础身份
-    if (this.myDeviceId.length === 0) {
-      this.myDeviceId = `PH-${Date.now().toString(36)}`;
+    if (this.myName.length === 0) {
+      this.myName = `Device-${Date.now().toString(36)}`;
     }
 
     const udp = socket.constructUDPSocketInstance();
@@ -123,7 +128,7 @@ export class DiscoveryService {
       const text = decodeUtf8(info.message);
       const fromIp = String(info.remoteInfo.address ?? '');
       const dev = parseBeacon(text, fromIp);
-      if (dev && dev.deviceId !== this.myDeviceId) {
+      if (dev && dev.deviceId !== this.myDeviceIdentity) {
         dev.lastSeen = Date.now();
         this.devices.set(dev.deviceId, dev);
         if (this.listener) {
@@ -147,7 +152,9 @@ export class DiscoveryService {
     // 周期广播
     const broadcast = () => {
       if (!this.running || !this.udpSocket) { return; }
-      const beacon = `${BEACON_PREFIX}|${this.myDeviceId}|${this.myName}|${transferPort}|1.0|${this.myBrand}`;
+      const localIp = this.selfIp.length > 0 ? this.selfIp : '0.0.0.0';
+      // 统一格式: PT-BEACON|<deviceName>|<brand>|<ip>|<port>|
+      const beacon = `${BEACON_PREFIX}|${this.myName}|${this.myBrand}|${localIp}|${transferPort}|`;
       const payload = encodeUtf8(beacon);
       const targets = [this.broadcastAddress(this.selfIp), '255.255.255.255'];
       for (const addr of targets) {
@@ -200,6 +207,7 @@ export class DiscoveryService {
   /** 记录本机 IP（由上层填充，通常是 WiFi/以太网地址） */
   setLocalIp(ip: string): void {
     this.selfIp = ip;
+    this.myDeviceIdentity = `${this.myName}|${ip}`;
   }
 
   /** 停止发现流程 */
