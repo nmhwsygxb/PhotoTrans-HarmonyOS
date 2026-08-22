@@ -392,7 +392,7 @@ export class NetworkService {
     const rawPath = pathMatch ? pathMatch[1] : 'file.bin';
     let fileName = 'file.bin';
     try { fileName = decodeURIComponent(rawPath); } catch (e) { fileName = rawPath; }
-    // 安全检查: 防止路径穿越
+    // 安全检查：防止路径穿越
     fileName = fileName.replace(/[\\/:*?"<>|]/g, '_');
 
     // 解析 Content-Length
@@ -532,7 +532,7 @@ export class NetworkService {
    * @param ip 目标 IP
    * @param port 目标端口
    * @param files 待发送文件
-   * @param peerName 展示用
+   * @param peerName 显示用
    */
   async connectAndSend(ip: string, port: number, files: PendingFile[], peerName: string): Promise<void> {
     if (this.isSending) {
@@ -607,7 +607,7 @@ export class NetworkService {
     await this.openClient(this.clientTargetIp, this.clientTargetPort, this.clientTargetPeerName);
   }
 
-  /** 关闭客户端连接（不清理队列） */
+  /** 关闭客户端连接（不清除队列） */
   private closeClient(): void {
     this.clientConnection = null;
     this.clientTextBuf = '';
@@ -669,7 +669,14 @@ export class NetworkService {
         if (read <= 0) {
           completed = true;
           try { inStream!.closeSync(); } catch (e2) { /* ignore */ }
-          resolve();
+          // 文件数据已发完，等待 HTTP 响应确认
+          this.waitHttpResponse(conn, 5000).then(() => {
+            resolve();
+          }).catch((err) => {
+            // 即使没收到响应也视为完成（兼容对方不返回响应的情况）
+            this.logBuf('httpResponse', `no response (${err})`);
+            resolve();
+          });
           return;
         }
         const chunk = buf.slice(0, read);
@@ -705,6 +712,31 @@ export class NetworkService {
         });
       };
       pump();
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // HTTP 响应读取
+  // ---------------------------------------------------------------------------
+
+  /** 等待 HTTP 响应（如 200 OK），超时则忽略 */
+  private waitHttpResponse(conn: socket.TCPSocketConnection, timeoutMs: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        resolve();
+      }, timeoutMs);
+      const onMsg = (buffer: ArrayBuffer) => {
+        clearTimeout(timer);
+        const text = decodeUtf8(buffer);
+        this.logBuf('httpResponse', text.substring(0, 100));
+        resolve();
+      };
+      try {
+        conn.on('message', onMsg);
+      } catch (e) {
+        clearTimeout(timer);
+        resolve();
+      }
     });
   }
 
@@ -805,7 +837,7 @@ export class NetworkService {
     }
   }
 
-  /** 查询任务列表（远端传输完成后的快照） */
+  /** 查询任务列表（远程传输完成后的快照） */
   getActiveTasks(): TransferTaskProgress[] {
     const out: TransferTaskProgress[] = [];
     this.tasks.forEach(v => out.push(v));
