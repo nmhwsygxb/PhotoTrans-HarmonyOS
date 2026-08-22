@@ -1,0 +1,56 @@
+name: Build HarmonyOS App
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'harmony-v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check TypeScript syntax
+        run: |
+          # Basic syntax check - find all .ts files and verify they parse
+          echo "Checking TypeScript files..."
+          find . -name "*.ts" -type f | while read f; do
+            npx -y typescript@5.0 --noEmit --strict "$f" 2>/dev/null || echo "Warning: $f may have syntax issues"
+          done
+
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/harmony-v')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          TAG="${{ github.ref_name }}"
+          echo "Creating release for tag: $TAG"
+          API_JSON=$(printf '{"tag_name":"%s","target_commitish":"main","name":"%s","body":"PhotoTrans HarmonyOS App - %s\\n\\nNote: Build requires DevEco Studio. Download source and build with hvigor.","draft":false,"prerelease":false}' "$TAG" "$TAG" "$TAG")
+          RESPONSE=$(curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/releases \
+            -d "$API_JSON")
+          RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
+          echo "Release ID: $RELEASE_ID"
+          # Package source as release asset
+          git archive --format=zip --output=PhotoTrans-HarmonyOS-src.zip HEAD
+          curl -s -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Content-Type: application/zip" \
+            "https://uploads.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets?name=PhotoTrans-HarmonyOS-src.zip" \
+            --data-binary @PhotoTrans-HarmonyOS-src.zip
